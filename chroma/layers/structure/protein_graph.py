@@ -291,8 +291,9 @@ class ProteinFeatureGraph(nn.Module):
             self.register_buffer(f"edge_means_{i}", tensor)
         return
 
-    def _reference_stats(self, reference_pdb):
-        X, C, _ = Protein.from_PDBID(reference_pdb).to_XCS()
+    def _reference_stats(self, reference_pdb, reference_path="/beagle3/gavoth/cwaltmann/code/chroma_weights/2g3n.cif"):
+        #X, C, _ = Protein.from_PDBID(reference_pdb).to_XCS()
+        X, C, _ = Protein(reference_path).to_XCS()
         stats_dict = self._feature_stats(X, C)
         return stats_dict
 
