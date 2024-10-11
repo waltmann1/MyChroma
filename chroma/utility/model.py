@@ -84,6 +84,7 @@ def load_model(
         model (nn.Module): Torch model with loaded weights.
     """
 
+    print(weights)
     # Process weights path
     if str(weights).startswith("named:"):
         weights = weights.split("named:")[1]
@@ -106,8 +107,11 @@ def load_model(
         )
 
     # load model weights
+    print("go")
     params = torch.load(weights, map_location="cpu")
+    print("went")
     model = model_class(**params["init_kwargs"]).to(device)
+    print("to_device")
     missing_keys, unexpected_keys = model.load_state_dict(
         params["model_state_dict"], strict=strict
     )

@@ -77,20 +77,22 @@ class Chroma(nn.Module):
         # If no device is explicity specified automatically set device
         if device is None:
             if torch.cuda.is_available():
-                device = "cuda"
+                device = "cuda" 
             else:
                 device = "cpu"
-
+        print("device: ", device)
+        print("weights_backbone: ",weights_backbone )
         self.backbone_network = graph_backbone.load_model(
             weights_backbone, device=device, strict=strict, verbose=verbose
         ).eval()
-
+        print("loaded backbone")
         self.design_network = graph_design.load_model(
             weights_design,
             device=device,
             strict=strict,
             verbose=False,
         ).eval()
+        print("loaded design")
 
     def sample(
         self,
@@ -420,6 +422,223 @@ class Chroma(nn.Module):
                 }
 
             return proteins, full_output_dictionary
+
+    def cg_sample(
+        self,
+        cg_map,
+        cg_target,
+            allowed,
+            cg_loss_weight,
+            fixed=False,
+            noise_range=None,
+        # Backbone Args
+        samples: int = 1,
+        steps: int = 500,
+        chain_lengths: List[int] = [100],
+        tspan: List[float] = (1.0, 0.001),
+        protein_init: Protein = None,
+        conditioner: Optional[nn.Module] = None,
+        langevin_factor: float = 2,
+        langevin_isothermal: bool = False,
+        inverse_temperature: float = 10,
+        initialize_noise: bool = True,
+        integrate_func: Literal["euler_maruyama", "heun"] = "euler_maruyama",
+        sde_func: Literal["langevin", "reverse_sde", "ode"] = "reverse_sde",
+        trajectory_length: int = 200,
+        full_output: bool = False,
+        # Sidechain Args
+        design_ban_S: Optional[List[str]] = None,
+        design_method: Literal["potts", "autoregressive"] = "potts",
+        design_selection: Optional[Union[str, torch.Tensor]] = None,
+        design_t: Optional[float] = 0.5,
+        temperature_S: float = 0.01,
+        temperature_chi: float = 1e-3,
+        top_p_S: Optional[float] = None,
+        regularization: Optional[str] = "LCP",
+        potts_mcmc_depth: int = 500,
+        potts_proposal: Literal["dlmc", "chromatic"] = "dlmc",
+        potts_symmetry_order: int = None,
+        verbose: bool = False,
+    ) -> Union[
+        Union[Protein, List[Protein]], Tuple[Union[Protein, List[Protein]], dict]
+    ]:
+        """
+        Performs Backbone Sampling and Sequence Design and returns a Protein or list
+        of Proteins. Optionally this method can return additional arguments to show
+        details of the sampling procedure.
+
+        Args:
+            Backbone sampling:
+                samples (int, optional): The number of proteins to sample.
+                    Default is 1.
+                steps (int, optional): The number of integration steps for the SDE.
+                    Default is 500.
+                chain_lengths (List[int], optional): The lengths of the protein chains.
+                    Default is [100].
+                conditioner (Conditioner, optional): The conditioner object that
+                    provides the conditioning information. Default is None.
+                langevin_isothermal (bool, optional): Whether to use the isothermal
+                    version of the Langevin SDE. Default is False.
+                integrate_func (str, optional): The name of the integration function to
+                    use. Default is “euler_maruyama”.
+                sde_func (str, optional): The name of the SDE function to use. Defaults
+                    to “reverse_sde”.
+                langevin_factor (float, optional): The factor that controls the strength
+                    of the Langevin noise. Default is 2.
+                inverse_temperature (float, optional): The inverse temperature parameter
+                    for the SDE. Default is 10.
+                protein_init (Protein, optional): The initial protein state. Defaults
+                    to None.
+                full_output (bool, optional): Whether to return the full outputs of the
+                    SDE integration, including the protein sample trajectory, the
+                    Xhat trajectory (the trajectory of the preceived denoising target)
+                    and the Xunc trajectory (the trajectory of the unconditional sample
+                    path). Default is False.
+                initialize_noise (bool, optional): Whether to initialize the noise for
+                    the SDE integration. Default is True.
+                tspan (List[float], optional): The time span for the SDE integration.
+                    Default is (1.0, 0.001).
+                trajectory_length (int, optional): The number of sampled steps in the
+                    trajectory output.  Maximum is `steps`. Default 200.
+                **kwargs: Additional keyword arguments for the integration function.
+
+            Sequence and sidechain sampling:
+                design_ban_S (list of str, optional): List of amino acid single-letter
+                    codes to ban, e.g. `["C"]` to ban cysteines.
+                design_method (str, optional): Specifies which method to use for design.
+                    Can be `potts` and `autoregressive`. Default is `potts`.
+                design_selection (str, optional): Clamp selection for
+                    conditioning on a subsequence during sequence sampling. Can be
+                    1) a PyMOl-like selection string
+                        (https://pymolwiki.org/index.php/Property_Selectors)
+                    or
+                    2) a binary design mask indicating positions with shape `(num_batch,
+                    num_residues)`. 1. indicating the residue to be designed and
+                    0. indicates the residue will be masked.
+                    e.g.
+                        design_selection = torch.Tensor([[0., 1. ,1., 0., 1. ... ]])
+                    or
+                    3) position-specific valid amino acid choices with shape
+                    `(num_batch, num_residues, num_alphabet)`.
+                design_t (float or torch.Tensor, optional): Diffusion time for models
+                    trained with diffusion augmentation of input structures. Setting `t=0`
+                    or `t=None` will condition the model to treat the structure as
+                    exact coordinates, while values of `t > 0` will condition
+                    the model to treat structures as though they were drawn from
+                    noise-augmented ensembles with that noise level. For robust design
+                    (default) we recommend `t=0.5`, or for literal design we recommend
+                    `t=0.0`. May be a float or a tensor of shape `(num_batch)`.
+                temperature_S (float, optional): Temperature for sequence sampling.
+                    Default 0.01.
+                temperature_chi (float, optional): Temperature for chi angle sampling.
+                    Default 1e-3.
+                top_p_S (float, optional): Top-p sampling cutoff for autoregressive
+                    sampling.
+                regularization (str, optional): Complexity regularization for
+                    sampling.
+                potts_mcmc_depth (int, optional): Depth of sampling (number of steps per
+                    alphabet letter times number of sites) per cycle.
+                potts_proposal (str): MCMC proposal for Potts sampling. Currently implemented
+                    proposals are `dlmc` (default) for Discrete Langevin Monte Carlo [1] or
+                    `chromatic` for graph-colored block Gibbs sampling.
+                    [1] Sun et al. Discrete Langevin Sampler via Wasserstein Gradient Flow (2023).
+                potts_symmetry_order (int, optional): Symmetric design.
+                    The first `(num_nodes // symmetry_order)` residues in the protein
+                    system will be variable, and all consecutively tiled sets of residues
+                    will be locked to these during decoding. Internally this is accomplished by
+                    summing the parameters Potts model under a symmetry constraint
+                    into this reduced sized system and then back imputing at the end.
+                    Currently only implemented for Potts models.
+
+        Returns:
+            proteins: Sampled `Protein` object or list of  sampled `Protein` objects in
+                the case of multiple outputs.
+            full_output_dictionary (dict, optional): Additional outputs if
+                `full_output=True`.
+        """
+
+        # Get KWARGS
+        input_args = locals()
+        if noise_range is None:
+            self.backbone_network.noise_perturb.noise_schedule.log_snr_range = (0,3)
+        else:
+            self.backbone_network.noise_perturb.noise_schedule.log_snr_range = (noise_range[0], noise_range[1])
+        noise = self.backbone_network.noise_perturb.noise_schedule
+
+        from chroma.layers.structure.conditioners import CGCoordinateConditioner, CGCoordinateFixedConditioner
+        if not fixed:
+            cg_conditioner = CGCoordinateConditioner(cg_map, cg_target, allowed, noise, cg_loss_weight)
+        else:
+            cg_conditioner = CGCoordinateFixedConditioner(cg_map, cg_target, allowed, noise, cg_loss_weight)
+        # Dynamically get acceptable kwargs for each method
+        backbone_keys = set(inspect.signature(self._sample).parameters)
+        design_keys = set(inspect.signature(self.design).parameters)
+        #cg_keys = set(inspect.signature(CGCoordinateConditioner).parameters)
+
+        # Filter kwargs for each method using dictionary comprehension
+        backbone_kwargs = {k: input_args[k] for k in input_args if k in backbone_keys}
+        design_kwargs = {k: input_args[k] for k in input_args if k in design_keys}
+        #cg_kwargs = {k: input_args[k] for k in input_args if k in cg_keys}
+
+        # Perform Sampling
+
+        sample_output = self._sample(protein_init=protein_init, steps=steps, conditioner=cg_conditioner,
+                                     inverse_temperature=inverse_temperature, initialize_noise=initialize_noise,
+                                     sde_func=sde_func)
+
+        #sample_output = self._sample(protein_init=protein_init, steps=steps,
+         #                            inverse_temperature=inverse_temperature, initialize_noise=initialize_noise,
+         #                            sde_func=sde_func)
+
+        if full_output:
+            protein_sample, output_dictionary = sample_output
+        else:
+            protein_sample = sample_output
+            output_dictionary = None
+
+        proteins = protein_sample
+
+        # Perform conditioner postprocessing
+        if (conditioner is not None) and hasattr(conditioner, "_postprocessing_"):
+            proteins, output_dictionary = self._postprocess(
+                conditioner, proteins, output_dictionary
+            )
+
+        if full_output:
+            return proteins, output_dictionary
+        else:
+            return proteins
+
+    def _postprocess(self, conditioner, proteins, output_dictionary):
+        if output_dictionary is None:
+            if isinstance(proteins, list):
+                proteins = [
+                    conditioner._postprocessing_(protein) for protein in proteins
+                ]
+            else:
+                proteins = conditioner._postprocessing_(proteins)
+        else:
+            if isinstance(proteins, list):
+                p_dicts = []
+                proteins = []
+                for i, protein in enumerate(proteins):
+                    p_dict = {}
+                    for key, value in output_dictionary.items():
+                        p_dict[key] = value[i]
+
+                    protein, p_dict = conditioner._postprocessing_(protein, p_dict)
+                    p_dicts.append(p_dict)
+
+                # Merge Output Dictionaries
+                output_dictionary = defaultdict(list)
+                for p_dict in p_dicts:
+                    for k, v in p_dict.items():
+                        output_dictionary[k].append(v)
+            else:
+                proteins, output_dictionary = conditioner._postprocessing_(
+                    proteins, output_dictionary
+                )
+        return proteins, output_dictionary
 
     def _format_trajectory(self, outs, key, trajectory_length):
         trajectories = [

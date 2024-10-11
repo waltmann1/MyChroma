@@ -397,6 +397,8 @@ class FourierFeaturization(nn.Module):
             self.register_parameter("B", torch.nn.Parameter(B))
 
     def forward(self, inputs):
+        print("self.B.device", self.B.device)
+        print("inputs", type(inputs), inputs.device)
         h = inputs @ self.B
         return torch.cat([h.cos(), h.sin()], -1)
 

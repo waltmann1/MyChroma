@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
+import copy as cp
 import torch.nn.functional as F
 from scipy.sparse.csgraph import shortest_path
 from torch import nn
@@ -244,6 +245,224 @@ class SubsequenceConditioner(Conditioner):
         if self.mask_condition is not None:
             logp_S = self.mask_condition * logp_S
         U = U + self.weight * -logp_S.sum()
+        return X, C, O, U, t
+
+
+class CGCoordinateFixedConditioner(Conditioner):
+    """Potential for optimizing towards arbitrary CG coordinates.
+
+        Args:
+            map (list): Residues mapped to each CG bead
+            example [[1,2,9], [3,4,5,6], [7,8]] maps 9 residues to 3 CG beads
+            X_target (numpy array): Target CG Coordinates with shape `(len(map), 3)`.
+            allowed (float): allowed RMSD in Angstroms
+            noise_schedule (GaussianNoiseSchedule): Diffusion time schedule for loss
+            scaling.
+            cg_loss_weight (float): Scale factor for the overall restraint.
+        """
+
+    def __init__(
+            self,
+            map,
+            X_target,
+            allowed,
+            noise_schedule,
+            cg_loss_weight,
+            debug: bool = False
+    ):
+        super().__init__()
+
+        self.allowed = allowed
+        self.debug = debug
+        self.noise_schedule = noise_schedule
+        self.cg_loss_weight = cg_loss_weight
+        #quit()
+        self.fmap = cp.deepcopy(map)
+        self.X_target = torch.Tensor(X_target)
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            self.X_target = torch.Tensor(X_target).to("cuda")
+        else:
+            self.X_target = torch.Tensor(X_target)
+        torch.cuda.empty_cache()
+        for ind, map_j in enumerate(self.fmap):
+            #map_j = torch.LongTensor(map_j)
+            map_j = np.array([int(thing) for thing in map_j], dtype=np.int64)
+            map_j = torch.from_numpy(map_j)
+            map_j = torch.subtract(map_j, 1)
+            self.fmap[ind] = map_j
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                self.fmap[ind] = map_j.to("cuda")
+
+        #self.register_buffer("X_target", torch.Tensor(X_target))
+
+    @validate_XC()
+    def forward(
+        self,
+        X: torch.Tensor,
+        C: torch.LongTensor,
+        O: torch.Tensor,
+        U: torch.Tensor,
+        t: Union[torch.Tensor, float],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.LongTensor,
+        torch.Tensor,
+        torch.Tensor,
+        Union[torch.Tensor, float],
+    ]:
+
+        #get alpha carbon positions
+        #temp = [X[0][np.subtract(map_i, 1)][0][1] for map_i in self.map]
+
+        #print(self.fmap)
+        #print("a",X.size())
+        #print(self.fmap[0])
+        #print(torch.index_select(X,1,self.fmap[0]))
+        temp = [torch.mean(torch.index_select(X, 1, map_i)[0][:, 1:2], dim=0)[0]
+                for map_i in self.fmap]
+        mapped = torch.stack(temp)
+
+
+        distances = torch.subtract(mapped, self.X_target)
+        #print("a",distances.size())
+        #print("b", X.size())
+
+        distances = [torch.stack([torch.stack([distances[i], distances[i], distances[i], distances[i]])]) for i in range(len(distances)) ]
+        #distances = [torch.stack([torch.stack([distances[i]])]) for i in
+                     #range(len(distances))]
+        #print("b",len(distances), distances[0].size())
+        distances = torch.stack(distances)
+        print("c", distances[0][0])
+        new_X = torch.clone(X)
+
+        #print(shifted_map)
+        print(distances.size())
+        #new_X[0, shifted_map, 0:4] = torch.subtract(X[0, shifted_map, 0:4], distances)
+
+        for ind, res_ind in enumerate(self.fmap):
+            #bb_inds = torch.Tensor([0,1,2,3], dtype=torch.long)
+            #bb_inds.to("cuda")
+            #print(res_ind)
+            #print(bb_inds)
+            new_X[0, res_ind, 0:4] = torch.subtract(X[0, res_ind, 0:4], distances[ind])
+            #new_X[0, res_ind, (0,1,2,3)] = torch.subtract(X[0, res_ind, (0,1,2,3)], distances[ind])
+            #new_X[0, res_ind, 0] = torch.subtract(X[0, res_ind, 0], distances[ind])
+            #new_X[0, res_ind, 1] = torch.subtract(X[0, res_ind, 1], distances[ind])
+            #new_X[0, res_ind, 2] = torch.subtract(X[0, res_ind, 2], distances[ind])
+            #new_X[0, res_ind, 3] = torch.subtract(X[0, res_ind, 3], distances[ind])
+
+
+
+        #X = torch.subtract(X, to_sub)
+
+        #temp = [new_X[0][np.subtract(map_i, 1)][0][1] for map_i in self.map]
+        #mapped = torch.stack(temp)
+
+        #distances = torch.subtract(mapped, self.X_target)
+        #print(distances[0])
+
+        return new_X, C, O, U, t
+class CGCoordinateConditioner(Conditioner):
+    """Potential for optimizing towards arbitrary CG coordinates.
+
+        Args:
+            map (list): Residues mapped to each CG bead
+            example [[1,2,9], [3,4,5,6], [7,8]] maps 9 residues to 3 CG beads
+            X_target (numpy array): Target CG Coordinates with shape `(len(map), 3)`.
+            allowed (float): allowed RMSD in Angstroms
+            noise_schedule (GaussianNoiseSchedule): Diffusion time schedule for loss
+            scaling.
+            cg_loss_weight (float): Scale factor for the overall restraint.
+        """
+
+    def __init__(
+            self,
+            map,
+            X_target,
+            allowed,
+            noise_schedule,
+            cg_loss_weight,
+            debug: bool = False
+    ):
+        super().__init__()
+
+        self.allowed = allowed
+        self.debug = debug
+        self.noise_schedule = noise_schedule
+        self.cg_loss_weight = cg_loss_weight
+        print(X_target)
+        #quit()
+        self.map = cp.deepcopy(map)
+
+        self.X_target = torch.Tensor(X_target)
+        print("checks")
+        print(torch.cuda.is_available(), torch.cuda.device_count())
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            self.X_target = torch.Tensor(X_target).to("cuda")
+        else:
+            self.X_target = torch.Tensor(X_target)
+        torch.cuda.empty_cache()
+        for ind, map_i in enumerate(self.map):
+            map_i = np.array([int(thing) for thing in map_i], dtype=np.int64)
+            map_i = torch.from_numpy(map_i)
+            map_i = torch.subtract(map_i, 1)
+            self.map[ind] = map_i
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                #self.map[ind] = torch.LongTensor(map_i).to("cuda")
+                self.map[ind] = map_i.to("cuda")
+
+        #self.register_buffer("X_target", torch.Tensor(X_target))
+
+    @validate_XC()
+    def forward(
+        self,
+        X: torch.Tensor,
+        C: torch.LongTensor,
+        O: torch.Tensor,
+        U: torch.Tensor,
+        t: Union[torch.Tensor, float],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.LongTensor,
+        torch.Tensor,
+        torch.Tensor,
+        Union[torch.Tensor, float],
+    ]:
+
+        #get alpha carbon positions
+        #print("X size", X.size())
+        #print("device X_target", self.X_target.device)
+        #print("device map_i", self.map[0].device)
+        #print("X[0]", X[0])
+        temp = [torch.mean(torch.index_select(X, 1, map_i)[0][:, 1:2], dim=0)[0]
+                for map_i in self.map]
+        #print(self.map[4], "P4 bead", torch.index_select(X,1,self.map[4])[0][:, 1:2])
+        #print("really bead", X[0][0:4][0][1])
+        #print("first two temp", temp[0:2])
+        mapped = torch.stack(temp)
+        #print("mapped size", mapped.size())
+        #print("mapped", mapped)
+        #print("target", self.X_target)
+
+        #print("norm(sub)", torch.norm(torch.subtract(mapped, self.X_target), dim=1))
+
+
+
+        rmsd = torch.sqrt(torch.mean(torch.square(torch.norm(torch.subtract(mapped, self.X_target), dim=1)), dim=0))
+        print("rmsd")
+        print(rmsd)
+        #print(rmsd-self.allowed)
+        #quit()
+        #scale_t = self.cg_loss_weight * self.noise_schedule.SNR(t).sqrt().clamp(
+         #   min=1e-3, max=3.0)
+        scale_t = self.cg_loss_weight
+        print(self.noise_schedule.SNR(t), t)
+        if self.noise_schedule is not None:
+            scale_t = self.cg_loss_weight * self.noise_schedule.SNR(t).clamp(min=1, max=5.0)
+        neglogp = scale_t * F.softplus(rmsd - self.allowed)
+        print(rmsd - self.allowed)
+        print(F.softplus(rmsd - self.allowed))
+        U = U + neglogp
         return X, C, O, U, t
 
 
