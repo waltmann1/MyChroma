@@ -268,6 +268,7 @@ class CGCoordinateFixedConditioner(Conditioner):
             allowed,
             noise_schedule,
             cg_loss_weight,
+            device="cpu",
             debug: bool = False
     ):
         super().__init__()
@@ -276,11 +277,12 @@ class CGCoordinateFixedConditioner(Conditioner):
         self.debug = debug
         self.noise_schedule = noise_schedule
         self.cg_loss_weight = cg_loss_weight
+        self.device=device
         #quit()
         self.fmap = cp.deepcopy(map)
         self.X_target = torch.Tensor(X_target)
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            self.X_target = torch.Tensor(X_target).to("cuda")
+            self.X_target = torch.Tensor(X_target).to(str(self.device))
         else:
             self.X_target = torch.Tensor(X_target)
         torch.cuda.empty_cache()
@@ -291,7 +293,7 @@ class CGCoordinateFixedConditioner(Conditioner):
             map_j = torch.subtract(map_j, 1)
             self.fmap[ind] = map_j
             if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-                self.fmap[ind] = map_j.to("cuda")
+                self.fmap[ind] = map_j.to(str(self.device))
 
         #self.register_buffer("X_target", torch.Tensor(X_target))
 
@@ -332,11 +334,11 @@ class CGCoordinateFixedConditioner(Conditioner):
                      #range(len(distances))]
         #print("b",len(distances), distances[0].size())
         distances = torch.stack(distances)
-        print("c", distances[0][0])
+        #print("c", distances[0][0])
         new_X = torch.clone(X)
 
         #print(shifted_map)
-        print(distances.size())
+        #print(distances.size())
         #new_X[0, shifted_map, 0:4] = torch.subtract(X[0, shifted_map, 0:4], distances)
 
         for ind, res_ind in enumerate(self.fmap):
@@ -358,7 +360,7 @@ class CGCoordinateFixedConditioner(Conditioner):
         #temp = [new_X[0][np.subtract(map_i, 1)][0][1] for map_i in self.map]
         #mapped = torch.stack(temp)
 
-        #distances = torch.subtract(mapped, self.X_target)
+        distances = torch.subtract(mapped, self.X_target)
         #print(distances[0])
 
         return new_X, C, O, U, t
@@ -382,6 +384,7 @@ class CGCoordinateConditioner(Conditioner):
             allowed,
             noise_schedule,
             cg_loss_weight,
+            device="cpu",
             debug: bool = False
     ):
         super().__init__()
@@ -390,18 +393,20 @@ class CGCoordinateConditioner(Conditioner):
         self.debug = debug
         self.noise_schedule = noise_schedule
         self.cg_loss_weight = cg_loss_weight
-        print(X_target)
+        self.device=device
+        #print(X_target)
         #quit()
         self.map = cp.deepcopy(map)
 
         self.X_target = torch.Tensor(X_target)
-        print("checks")
-        print(torch.cuda.is_available(), torch.cuda.device_count())
+        #print("checks")
+        #print(torch.cuda.is_available(), torch.cuda.device_count())
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            self.X_target = torch.Tensor(X_target).to("cuda")
+            #print("looking X_target found the device, cuda:", self.device)
+            self.X_target = torch.Tensor(X_target).to(str(self.device))
         else:
             self.X_target = torch.Tensor(X_target)
-        torch.cuda.empty_cache()
+        #print("lookign map found the device, cuda:", self.device)
         for ind, map_i in enumerate(self.map):
             map_i = np.array([int(thing) for thing in map_i], dtype=np.int64)
             map_i = torch.from_numpy(map_i)
@@ -409,7 +414,8 @@ class CGCoordinateConditioner(Conditioner):
             self.map[ind] = map_i
             if torch.cuda.is_available() and torch.cuda.device_count() > 0:
                 #self.map[ind] = torch.LongTensor(map_i).to("cuda")
-                self.map[ind] = map_i.to("cuda")
+                self.map[ind] = map_i.to(str(self.device))
+        torch.cuda.empty_cache()
 
         #self.register_buffer("X_target", torch.Tensor(X_target))
 
@@ -434,6 +440,8 @@ class CGCoordinateConditioner(Conditioner):
         #print("device X_target", self.X_target.device)
         #print("device map_i", self.map[0].device)
         #print("X[0]", X[0])
+        #print("X device", X.device)
+        #print("map_i device", self.map[0].device)
         temp = [torch.mean(torch.index_select(X, 1, map_i)[0][:, 1:2], dim=0)[0]
                 for map_i in self.map]
         #print(self.map[4], "P4 bead", torch.index_select(X,1,self.map[4])[0][:, 1:2])
@@ -449,19 +457,19 @@ class CGCoordinateConditioner(Conditioner):
 
 
         rmsd = torch.sqrt(torch.mean(torch.square(torch.norm(torch.subtract(mapped, self.X_target), dim=1)), dim=0))
-        print("rmsd")
-        print(rmsd)
+        #print("rmsd")
+        #print(rmsd)
         #print(rmsd-self.allowed)
         #quit()
         #scale_t = self.cg_loss_weight * self.noise_schedule.SNR(t).sqrt().clamp(
          #   min=1e-3, max=3.0)
         scale_t = self.cg_loss_weight
-        print(self.noise_schedule.SNR(t), t)
+        #print(self.noise_schedule.SNR(t), t)
         if self.noise_schedule is not None:
             scale_t = self.cg_loss_weight * self.noise_schedule.SNR(t).clamp(min=1, max=5.0)
         neglogp = scale_t * F.softplus(rmsd - self.allowed)
-        print(rmsd - self.allowed)
-        print(F.softplus(rmsd - self.allowed))
+        #print(rmsd - self.allowed)
+        #print(F.softplus(rmsd - self.allowed))
         U = U + neglogp
         return X, C, O, U, t
 

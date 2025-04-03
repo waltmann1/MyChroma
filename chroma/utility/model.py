@@ -107,11 +107,11 @@ def load_model(
         )
 
     # load model weights
-    print("go")
+    #print("go")
     params = torch.load(weights, map_location="cpu")
-    print("went")
+    #print("went")
     model = model_class(**params["init_kwargs"]).to(device)
-    print("to_device")
+    #print("to_device")
     missing_keys, unexpected_keys = model.load_state_dict(
         params["model_state_dict"], strict=strict
     )

@@ -80,19 +80,19 @@ class Chroma(nn.Module):
                 device = "cuda" 
             else:
                 device = "cpu"
-        print("device: ", device)
-        print("weights_backbone: ",weights_backbone )
+        #print("device: ", device)
+        #print("weights_backbone: ",weights_backbone )
         self.backbone_network = graph_backbone.load_model(
             weights_backbone, device=device, strict=strict, verbose=verbose
         ).eval()
-        print("loaded backbone")
+        #print("loaded backbone")
         self.design_network = graph_design.load_model(
             weights_design,
             device=device,
             strict=strict,
             verbose=False,
         ).eval()
-        print("loaded design")
+        #print("loaded design")
 
     def sample(
         self,
@@ -567,9 +567,9 @@ class Chroma(nn.Module):
 
         from chroma.layers.structure.conditioners import CGCoordinateConditioner, CGCoordinateFixedConditioner
         if not fixed:
-            cg_conditioner = CGCoordinateConditioner(cg_map, cg_target, allowed, noise, cg_loss_weight)
+            cg_conditioner = CGCoordinateConditioner(cg_map, cg_target, allowed, noise, cg_loss_weight, device=next(self.parameters()).device)
         else:
-            cg_conditioner = CGCoordinateFixedConditioner(cg_map, cg_target, allowed, noise, cg_loss_weight)
+            cg_conditioner = CGCoordinateFixedConditioner(cg_map, cg_target, allowed, noise, cg_loss_weight, device=next(self.parameters()).device)
         # Dynamically get acceptable kwargs for each method
         backbone_keys = set(inspect.signature(self._sample).parameters)
         design_keys = set(inspect.signature(self.design).parameters)

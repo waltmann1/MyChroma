@@ -270,10 +270,10 @@ class ProteinFeatureGraph(nn.Module):
                     break
 
             if json_line is not None:
-                print("Loaded from cache")
+                #print("Loaded from cache")
                 param_dictionary = json.loads(json_line)
             else:
-                print(f"Computing reference stats for {reference_pdb}")
+                #print(f"Computing reference stats for {reference_pdb}")
                 param_dictionary = self._reference_stats(reference_pdb)
                 json_line = json.dumps(param_dictionary)
                 f.write(prefix + "\t" + json_line + "\n")
