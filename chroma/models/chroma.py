@@ -27,6 +27,9 @@ import torch.nn as nn
 from chroma.constants import AA20_3
 from chroma.data.protein import Protein
 from chroma.layers.structure.backbone import ProteinBackbone
+from chroma.layers import graph
+import gc
+from time import time
 from chroma.models import graph_backbone, graph_design
 
 
@@ -765,6 +768,370 @@ class Chroma(nn.Module):
         )
         protein.sys.update_with_XCS(X_sample, C=None, S=S_sample)
         return protein
+
+    def get_potts_energy(self,
+        protein: Protein,
+        design_ban_S: Optional[List[str]] = None,
+        design_method: Literal["potts", "autoregressive"] = "potts",
+        design_selection: Optional[Union[str, torch.Tensor]] = None,
+        design_t: Optional[float] = 0.5,
+        temperature_S: float = 0.01,
+        temperature_chi: float = 1e-3,
+        top_p_S: Optional[float] = None,
+        regularization: Optional[str] = "LCP",
+        potts_mcmc_depth: int = 500,
+        potts_proposal: Literal["dlmc", "chromatic"] = "dlmc",
+        potts_symmetry_order: Optional[int] = None,
+        verbose: bool = False,
+    ):
+
+
+        protein = copy.deepcopy(protein)
+        protein.canonicalize()
+        device = next(self.parameters()).device
+
+        traj_len = protein.sys.num_models()
+        batch_size =1
+        num_batches = int(traj_len / batch_size )
+        batches = [list(range(i*batch_size, (i+1) * batch_size)) for i in range(num_batches)]
+        X_traj, C, S = protein.to_XCS_trajectory()
+
+        #print("S", S.shape)
+        #import chroma.utility.polyseq as polyseq
+        #for i in range(S.shape[-1]):
+        #    print(i+1, int(S[0][i]), polyseq.index_to_triple(int(S[0][i])))
+        #quit()
+
+        X = torch.zeros((batch_size, *X_traj[0].shape[1:]), device=C.device)
+        for i in batches[0]:
+            X[i] = X_traj[i]
+        #print("X", X.shape)
+        #print("X_traj", len(X_traj), X_traj[0].shape)
+
+        #print("X", X.device)
+        #print("X_traj", len(X_traj))
+
+        #X = X.expand(traj_len, *X.shape[1:])
+        C = C.expand(X.size(0), *C.shape[1:])
+
+        #print("S", S.device)
+        #print("C", C.device)
+
+
+        if design_method not in set(["potts", "autoregressive"]):
+            raise NotImplementedError(
+                "Valid design methods are potts and autoregressive, recieved"
+                f" {design_method}"
+            )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        mutations = self.generate_single_mutations(S)
+        #if X.shape[2] == 4:
+        #    X = nn.functional.pad(X, [0, 0, 0, 10])
+
+        #print("node_h", node_h.shape)
+        #print("X", X.shape)
+        #print("C", C.shape)
+        node_h, edge_h, edge_idx, mask_i, mask_ij = self.design_network.encode(X, C, t=0)
+        h, J = self.design_network.decoder_S_potts.forward(node_h, edge_h, edge_idx, mask_i, mask_ij)
+        U_total = self.potts_from_h_J(h, J, S, edge_idx).sum(1).detach()
+        #print("U_total", U_total.shape)
+        U_mutate_total = self.potts_from_h_J(h, J, mutations, edge_idx).sum(1).detach()
+        #print("U_mutate_total", U_mutate_total.shape)
+
+        a = time()
+        for i in range(1, num_batches):
+            #print("X", X.shape)
+            #print("X_traj", len(X_traj), X_traj[0].shape)
+            for ind, q in enumerate(batches[i]):
+                X[ind] = X_traj[q]
+            node_h, edge_h, edge_idx, mask_i, mask_ij = self.design_network.encode(X, C, t=0)
+            h, J = self.design_network.decoder_S_potts.forward(node_h, edge_h, edge_idx, mask_i, mask_ij)
+            U = self.potts_from_h_J(h, J, S, edge_idx)
+            U_mutate = self.potts_from_h_J(h,J,mutations, edge_idx).sum(1).detach()
+            U_total += U.sum(1).detach()
+            U_mutate_total = torch.add(U_mutate.detach(), U_mutate_total.detach())
+            del h, J, edge_idx
+            gc.collect()
+            torch.cuda.empty_cache()
+            #U_mean = U.mean(dim=1)
+            #U_mutate_mean = U_mutate.mean(dim=1)
+            #print(i,time()-a)
+        U_mean = torch.divide(U_total, num_batches * batch_size)
+        U_mutate_mean = torch.divide(U_mutate_total, num_batches * batch_size)
+
+        return S[0].cpu().numpy(), mutations.cpu().numpy(), torch.subtract(U_mutate_mean, U_mean).cpu().numpy()
+
+    def get_potts_energy_derivatives_by_bin(self,
+                         protein: Protein,
+                         design_method: Literal["potts", "autoregressive"] = "potts",
+                         cg_frame_weight: Optional[torch.Tensor] = None,
+                         cg_bin_indices: Optional[torch.Tensor] = None,
+                         mutations: Optional[torch.Tensor]=None,
+                         batch_size: Optional[int] = 1
+                         ):
+
+        protein = copy.deepcopy(protein)
+        protein.canonicalize()
+        #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = next(self.parameters()).device
+
+        traj_len = protein.sys.num_models()
+
+        if cg_bin_indices is None:
+            cg_bin_indices = torch.randint(low=0, high=5, size=(traj_len,))
+        else:
+            cg_bin_indices.to(device)
+
+        cg_bin_indices = cg_bin_indices.to(device)
+
+        n_bins = int(cg_bin_indices.max() + 1)
+
+        num_batches = int(traj_len / batch_size)
+        batches = [list(range(i * batch_size, (i + 1) * batch_size)) for i in range(num_batches)]
+        X_traj, C, S = protein.to_XCS_trajectory()
+
+        #print("S", S.shape)
+        #print("cg_bin_indices", cg_bin_indices.shape, cg_bin_indices.device)
+        #print("cg_frame_weight", cg_frame_weight)
+
+
+        X = torch.zeros((batch_size, *X_traj[0].shape[1:]), device=C.device)
+        for i in batches[0]:
+            X[i] = X_traj[i]
+        C = C.expand(X.size(0), *C.shape[1:])
+
+        if design_method not in set(["potts", "autoregressive"]):
+            raise NotImplementedError(
+                "Valid design methods are potts and autoregressive, recieved"
+                f" {design_method}"
+            )
+
+        if mutations is None:
+            mutations = self.generate_single_mutations(S)
+        else:
+            mutations = mutations.to(device)
+        #gc.collect()
+        #torch.cuda.empty_cache()
+        #print("mutations", mutations.shape, mutations.device, mutations)
+        #quit()
+        if cg_frame_weight is None:
+            cg_frame_weight = torch.ones(traj_len)
+        #cg_frame_weight = torch.Tensor([1])
+        cg_frame_weight = cg_frame_weight.to(device)
+        cg_frame_weight = torch.divide(cg_frame_weight, cg_frame_weight.sum())
+
+        #print("cg_frame_weight", cg_frame_weight.device)
+        #print("cg_frame_weight", cg_frame_weight)
+
+        # print("X", X.shape)
+        # print("C", C.shape)
+
+        node_h, edge_h, edge_idx, mask_i, mask_ij = self.design_network.encode(X, C, t=0)
+        h, J = self.design_network.decoder_S_potts.forward(node_h, edge_h, edge_idx, mask_i, mask_ij)
+        U_total = self.potts_from_h_J(h, J, S, edge_idx).detach()
+        #print("U_total", U_total.shape)
+        U_total_weighted = U_total @ cg_frame_weight[batches[0]]
+        #print("U_total_weighted", U_total_weighted.shape)
+
+        U_bins = torch.zeros(n_bins, *U_total_weighted.shape[1:], device=device)
+        #print("U_bins", U_bins.shape)
+        for ind2 in range(batch_size):
+            U_bins[cg_bin_indices[ind2]] = torch.add(U_bins[cg_bin_indices[ind2]], U_total[0][ind2])
+        #print("U_bins", U_bins.shape)
+
+
+        U_mutate_total = self.potts_from_h_J(h, J, mutations, edge_idx).detach()
+        #print("U_mutate_total", U_mutate_total.shape)
+        #print("batches[0]", batches[0])
+        #print("cg_frame_weight", cg_frame_weight.shape )
+        #print("cg_frame_weight[[0]]", cg_frame_weight[[0]])
+        U_mutate_total_weighted = U_mutate_total @ cg_frame_weight[batches[0]]
+        #print("U_mutate_total_weighted", U_total_weighted.shape)
+
+        U_mutate_bins = torch.zeros(n_bins, *U_mutate_total_weighted.shape, device=device)
+        for ind2 in range(batch_size):
+            #print("U_mutate_bins[cg_bin_indices[ind2]]", U_mutate_bins[cg_bin_indices[ind2]].shape)
+            #print("U_mutate_total[:,ind2]", U_mutate_total.shape)
+            U_mutate_bins[cg_bin_indices[ind2]] = torch.add(U_mutate_bins[cg_bin_indices[ind2]], U_mutate_total[:,ind2])
+        #print("U_mutate_bins[:,0]", U_mutate_bins[:,0])
+
+        a = time()
+        for i in range(1, num_batches):
+            #print("batch number", i)
+            # print("X", X.shape)
+            # print("X_traj", len(X_traj), X_traj[0].shape)
+            for ind, q in enumerate(batches[i]):
+                #print("ind, q", ind, q)
+                #print("batches[i]", batches[i])
+                X[ind] = X_traj[q]
+            node_h, edge_h, edge_idx, mask_i, mask_ij = self.design_network.encode(X, C, t=0)
+            h, J = self.design_network.decoder_S_potts.forward(node_h, edge_h, edge_idx, mask_i, mask_ij)
+            U_total = self.potts_from_h_J(h, J, S, edge_idx).detach()
+            U_total_weighted = torch.add(U_total_weighted, U_total @ cg_frame_weight[batches[i]])
+            for ind, ind2 in enumerate(batches[i]):
+                U_bins[cg_bin_indices[ind2]] = torch.add(U_bins[cg_bin_indices[ind2]], U_total[0][ind])
+                #print("U_bins i", U_bins)
+
+
+            U_mutate_total = self.potts_from_h_J(h, J, mutations, edge_idx).detach()
+            U_mutate_total_weighted = torch.add(U_mutate_total_weighted, U_mutate_total @ cg_frame_weight[batches[i]])
+            for ind, ind2 in enumerate(batches[i]):
+                #print("ind, ind2", ind, ind2)
+                #print("cg_bin_indices[ind2]", cg_bin_indices[ind2])
+                U_mutate_bins[cg_bin_indices[ind2]] = torch.add(U_mutate_bins[cg_bin_indices[ind2]], U_mutate_total[:, ind])
+                #print("U_mutate_bins[:,0] i", U_mutate_bins[:,0])
+
+            del h, J, edge_idx
+            gc.collect()
+            torch.cuda.empty_cache()
+            #print(i, time() - a)
+
+        #print("U_mutate_bins", U_mutate_bins.shape)
+        #print("U_bins", U_bins.shape)
+        term1 = torch.subtract(U_mutate_bins, U_bins.unsqueeze(1))
+        #print("term 1", term1.shape)
+
+        values, counts = torch.unique(cg_bin_indices, return_counts=True)
+
+        print("values", values)
+        print("counts", counts)
+        print("cg_bin_indices", cg_bin_indices.shape)
+        print("term1", term1.shape)
+        term1_mean = term1 / counts.unsqueeze(1)
+
+
+
+        print("term1_mean", term1_mean.shape)
+        print("term1_mean.T[0]", term1_mean.T[0])
+
+        return S[0].cpu().numpy(), mutations.cpu().numpy(), term1_mean.cpu().numpy()
+
+    def potts_from_h_J(self, h,J,S, edge_idx):
+
+
+        #print("s to start", S.shape)
+        #print("h", h.shape)
+
+        struct_dim = copy.deepcopy(h.size(0))
+
+        #h = h.unsqueeze(0).expand(S.size(0), *h.shape).reshape(S.size(0)*h.size(0), *h.shape[1:])
+        h = h.unsqueeze(0).expand(S.size(0), *h.shape)
+        #print("new h", h.shape)
+
+        #J = J.unsqueeze(0).expand(S.size(0), *J.shape).reshape(S.size(0)*J.size(0), *J.shape[1:])
+        J = J.unsqueeze(0).expand(S.size(0), *J.shape)
+        #J = J.expand(S.size(0), *J.shape[1:])
+        #edge_idx = edge_idx.expand(S.size(0), *edge_idx.shape[1:])
+        edge_idx = edge_idx.unsqueeze(0).expand(S.size(0), *edge_idx.shape).reshape(S.size(0)*edge_idx.size(0), *edge_idx.shape[1:])
+        #edge_idx = edge_idx.unsqueeze(0).expand(S.size(0), *edge_idx.shape)
+        #print("new j", J.shape)
+        #print("new edge_idx", edge_idx.shape)
+        #print("s", S.shape)
+        old_shape = copy.deepcopy(S.shape)
+        S = (S.unsqueeze(1).expand(S.size(0),struct_dim,*S.shape[1:]))
+        S = S.reshape(edge_idx.size(0), *S.shape[2:])
+        #print("new s", S.shape)
+        #S = S.unsqueeze(1).expand(S.size(0), struct_dim, *S.shape[1:])
+
+
+
+
+        S_j = graph.collect_neighbors(S.unsqueeze(-1), edge_idx)
+        #print("S_j", S_j.shape)
+
+        S_j = S_j.unsqueeze(-1).expand(-1, -1, -1, h.shape[-1], -1)
+        #print(S_j.shape)
+
+        S_j = S_j.unsqueeze(0).reshape(J.size(0), int(S.size(0)/ J.size(0)),*S_j.shape[1:])
+
+        #print("S_j", S_j.shape)
+        #print("J", J.shape)
+        #quit()
+        J_ij = torch.gather(J, -1, S_j).squeeze(-1)
+        #print("J_ij", J_ij.shape)
+        # Sum out J contributions to yield local conditionals
+        J_i = J_ij.sum(3)
+        #print("J_i", J_i.shape)
+        #print("h", h.shape)
+        U_i = h + J_i
+        #print(J_i.shape)
+        #print(U_i.shape)
+
+        #print("final")
+        #print("U_i", U_i.shape)
+        #print("J_i", J_i.shape)
+
+
+        # Correct for double counting in total energy
+        #print("S", S.shape)
+        S_expand = S[..., None]
+        #S_expand = S_expand.unsqueeze(1).expand(S_expand.size(0), struct_dim, *S_expand.shape[1:])
+
+        S_expand = S_expand.unsqueeze(0).reshape(J_i.size(0), int(S_expand.size(0) / J_i.size(0)), *S_expand.shape[1:])
+        #print("S_expand", S_expand.shape)
+        U = (
+                torch.gather(U_i, -1, S_expand) - 0.5 * torch.gather(J_i, -1, S_expand)
+        ).sum((2, 3))
+
+        return U
+
+    def generate_single_mutations(self, S):
+
+        device = S.device
+
+        L = S.size(1)
+        mutations = S.repeat(L*20, 1)
+
+        #new_values = torch.arange(20, device=device).repeat(L)
+        #target_indices = torch.arange(L, device=device).repeat_interleave(20)
+        #mutations[torch.arange(L * 20), target_indices] = new_values
+
+        #n = 2
+        #start =546
+        start =0
+        #n= 217
+        n=L
+        new_values = torch.arange(20, device=device).repeat(n)
+        target_indices = torch.arange(start, start+n,1, device=device).repeat_interleave(20)
+
+        #print("mutations", mutations.shape)
+
+        #print("target ind")
+        mutations[torch.arange(n*20), target_indices] = new_values
+
+        mask = ~(mutations==S).all(dim=1)
+        return mutations[mask]
+
+    def generate_trimer_mutations(self, S):
+
+        device = S.device
+
+        L = S.size(1)
+        mutations = S.repeat(L * 20, 1)
+
+
+
+        #start = 546
+        start =0
+        n = 182
+        # n=L
+        new_values = torch.arange(20, device=device).repeat(n)
+
+        target_indices = torch.arange(start + n*0, start + n*1, 1, device=device).repeat_interleave(20)
+        mutations[torch.arange(n * 20), target_indices] = new_values
+
+        target_indices = torch.arange(start + n*1, start + n*2, 1, device=device).repeat_interleave(20)
+        mutations[torch.arange(n * 20), target_indices] = new_values
+
+        target_indices = torch.arange(start + n * 2, start + n * 3, 1, device=device).repeat_interleave(20)
+        mutations[torch.arange(n * 20), target_indices] = new_values
+
+
+        mask = ~(mutations == S).all(dim=1)
+        return mutations[mask]
+
 
     def _design_ar(self, protein, alphabet=None, temp_S=0.1, temp_chi=1e-3):
         X, C, S = protein.to_XCS()
